@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import {
-  Plus, Search, ChevronRight, ChevronDown, ChevronUp, X, AlertTriangle,
+  Plus, Search, ChevronDown, X, AlertTriangle,
   CheckCircle2, Clock, CircleDashed, Ban, Bell, Siren, CalendarClock,
   Download, Expand, Minimize2, ArrowUpDown, ArrowUp, ArrowDown,
   CalendarDays, Filter, Check, Trash2, Sparkles, Zap, Target, Pencil,
@@ -12,7 +12,11 @@ import {
 // ============================================================================
 const API_URL = 'https://script.google.com/macros/s/AKfycbya1KpcTtyAXqoMekfZU_VK7OiWWKcHK6od59GTQCoamDxyjYje06oUUYzLRfmBnD_o/exec';
 
-// Ordem exibida no dropdown de status (v2: Concluído, Em andamento, Não iniciado, Cancelado)
+// Chaves de localStorage para persistir preferências
+const LS_VIEW = 'demandas_view_v1';
+const LS_FILTERS = 'demandas_filters_v1';
+const LS_SORT = 'demandas_sort_v1';
+
 const STATUS_OPTIONS = ['Concluído', 'Em andamento', 'Não iniciado', 'Cancelado'];
 const PRIORIDADE_OPTIONS = ['Normal', 'Alta'];
 
@@ -129,9 +133,11 @@ const daysUntil = (iso) => {
   return Math.round(diff / (1000 * 60 * 60 * 24));
 };
 
+// FIX: normaliza status antes de checar (para suportar legado "Pendente"/"Andamento")
 const getSituacao = (item) => {
   if (!cleanDate(item.dataPrazo)) return null;
-  if (item.status === 'Concluído' || item.status === 'Cancelado') return null;
+  const st = normalizeStatus(item.status);
+  if (st === 'Concluído' || st === 'Cancelado') return null;
   const d = daysUntil(item.dataPrazo);
   if (d === null) return null;
   if (d < 0) return { kind: 'atrasada', days: d };
@@ -161,47 +167,55 @@ const sortWithHierarchy = (items, sortKey, sortDir) => {
     if (sortKey === 'id') {
       cmp = parseId(a.id).main - parseId(b.id).main;
     } else if (sortKey === 'descricao') {
-      cmp = a.descricao.localeCompare(b.descricao, 'pt-BR');
+      cmp = (a.descricao || '').localeCompare(b.descricao || '', 'pt-BR');
     } else if (sortKey === 'prioridade') {
-      // Blank (concluído/cancelado) sempre no final
-      const isDoneA = a.status === 'Concluído' || a.status === 'Cancelado';
-      const isDoneB = b.status === 'Concluído' || b.status === 'Cancelado';
+      // Concluído/cancelado sempre no final (após normalização)
+      const isDoneA = ['Concluído', 'Cancelado'].includes(normalizeStatus(a.status));
+      const isDoneB = ['Concluído', 'Cancelado'].includes(normalizeStatus(b.status));
       if (isDoneA && !isDoneB) return 1;
       if (!isDoneA && isDoneB) return -1;
       cmp = (a.prioridade === 'Alta' ? 0 : 1) - (b.prioridade === 'Alta' ? 0 : 1);
     } else if (sortKey === 'status') {
-      // Ordem alfabética: Andamento, Cancelado, Concluído, Não iniciado
       const statusLabel = (s) => {
         const st = STATUS_STYLE[normalizeStatus(s)];
         return st ? st.label : s;
       };
       cmp = statusLabel(a.status).localeCompare(statusLabel(b.status), 'pt-BR');
     } else if (sortKey === 'dataSolic') {
-      cmp = (cleanDate(a.dataSolic) || '9999').localeCompare(cleanDate(b.dataSolic) || '9999');
+      const da = cleanDate(a.dataSolic), db = cleanDate(b.dataSolic);
+      if (!da && !db) cmp = 0;
+      else if (!da) cmp = 1;
+      else if (!db) cmp = -1;
+      else cmp = da.localeCompare(db);
     } else if (sortKey === 'dataPrazo') {
-      // Datas em branco sempre no final, independente da direção
       const da = cleanDate(a.dataPrazo), db = cleanDate(b.dataPrazo);
-      if (!da && !db) return 0;
-      if (!da) return 1;
-      if (!db) return -1;
-      cmp = da.localeCompare(db);
+      if (!da && !db) cmp = 0;
+      else if (!da) return 1;  // sempre no fim
+      else if (!db) return -1;
+      else cmp = da.localeCompare(db);
     } else if (sortKey === 'solicitante') {
-      cmp = (a.solicitante || 'zzz').localeCompare(b.solicitante || 'zzz', 'pt-BR');
+      const sa = (a.solicitante || '').trim(), sb = (b.solicitante || '').trim();
+      if (!sa && !sb) cmp = 0;
+      else if (!sa) return 1;
+      else if (!sb) return -1;
+      else cmp = sa.localeCompare(sb, 'pt-BR');
     } else if (sortKey === 'diasRestantes') {
       const da = daysUntil(a.dataPrazo);
       const db = daysUntil(b.dataPrazo);
-      // Sem data sempre no final, independente da direção
-      if (da === null && db === null) return 0;
-      if (da === null) return 1;
-      if (db === null) return -1;
-      cmp = da - db;
+      // Sem data sempre no final
+      if (da === null && db === null) cmp = 0;
+      else if (da === null) return 1;
+      else if (db === null) return -1;
+      else cmp = da - db;
     }
+    // Tiebreaker estável: ID principal numérico
+    if (cmp === 0) cmp = parseId(a.id).main - parseId(b.id).main;
     return sortDir === 'asc' ? cmp : -cmp;
   };
 
   const sorted = [...tarefas].sort(sortFn);
 
-  // Recursivamente insere filhos em ordem
+  // Insere filhos sempre em ordem natural (sub.x.y crescente)
   const insertChildren = (result, parentId) => {
     const children = (subsByParent[parentId] || []).sort((a, b) => {
       const pa = parseId(a.id), pb = parseId(b.id);
@@ -219,7 +233,7 @@ const sortWithHierarchy = (items, sortKey, sortDir) => {
     insertChildren(result, String(t.id));
   });
 
-  // Órfãs
+  // Órfãs (sub sem pai)
   const handled = new Set(result.map(i => i.id));
   items.filter(i => !handled.has(i.id)).forEach(o => result.push(o));
 
@@ -244,29 +258,41 @@ const nextSubId = (items, idPrincipal) => {
   return `${idPrincipal}.${next}`;
 };
 
-// API
+// API com tratamento de erro robusto
 const api = {
   async list() {
     if (!API_URL) return null;
     const r = await fetch(`${API_URL}?action=list`);
-    if (!r.ok) throw new Error('Falha ao listar');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
   },
   async create(item) {
     if (!API_URL) return item;
     const r = await fetch(API_URL, { method: 'POST', body: JSON.stringify({ action: 'create', item }) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
   },
   async update(item) {
     if (!API_URL) return item;
     const r = await fetch(API_URL, { method: 'POST', body: JSON.stringify({ action: 'update', item }) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
   },
   async remove(id) {
     if (!API_URL) return { ok: true };
     const r = await fetch(API_URL, { method: 'POST', body: JSON.stringify({ action: 'delete', id }) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
   },
+};
+
+// LocalStorage helpers (com try/catch para modo privado/incógnito)
+const lsGet = (k, fallback) => {
+  try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fallback; }
+  catch { return fallback; }
+};
+const lsSet = (k, v) => {
+  try { localStorage.setItem(k, JSON.stringify(v)); } catch {}
 };
 
 // ============================================================================
@@ -276,19 +302,46 @@ export default function App() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  const [filterStatus, setFilterStatus] = useState(new Set());
-  const [filterPrioridade, setFilterPrioridade] = useState(new Set());
-  const [filterSolicitante, setFilterSolicitante] = useState(new Set());
-  const [filterSituacao, setFilterSituacao] = useState(new Set());
-  const [sortKey, setSortKey] = useState('id');
-  const [sortDir, setSortDir] = useState('desc');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+
+  // Filtros — restaurados do localStorage
+  const [filterStatus, setFilterStatus] = useState(() => new Set(lsGet(LS_FILTERS, {}).status || []));
+  const [filterPrioridade, setFilterPrioridade] = useState(() => new Set(lsGet(LS_FILTERS, {}).prio || []));
+  const [filterSolicitante, setFilterSolicitante] = useState(() => new Set(lsGet(LS_FILTERS, {}).solic || []));
+  const [filterSituacao, setFilterSituacao] = useState(() => new Set(lsGet(LS_FILTERS, {}).sit || []));
+
+  // Sort — restaurado do localStorage
+  const _initSort = lsGet(LS_SORT, { key: 'id', dir: 'desc' });
+  const [sortKey, setSortKey] = useState(_initSort.key);
+  const [sortDir, setSortDir] = useState(_initSort.dir);
+
   const [collapsed, setCollapsed] = useState(new Set());
   const [allCollapsed, setAllCollapsed] = useState(false);
   const [modal, setModal] = useState(null);
   const [confirmDel, setConfirmDel] = useState(null);
   const [toast, setToast] = useState(null);
   const [editing, setEditing] = useState(null);
-  const [view, setView] = useState('table'); // 'table' | 'gantt'
+  const [view, setView] = useState(() => lsGet(LS_VIEW, 'table'));
+
+  const searchInputRef = useRef(null);
+
+  // Debounce da busca (180ms — rápido o suficiente para parecer instantâneo)
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search), 180);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  // Persiste view, filtros, sort
+  useEffect(() => { lsSet(LS_VIEW, view); }, [view]);
+  useEffect(() => {
+    lsSet(LS_FILTERS, {
+      status: [...filterStatus],
+      prio: [...filterPrioridade],
+      solic: [...filterSolicitante],
+      sit: [...filterSituacao],
+    });
+  }, [filterStatus, filterPrioridade, filterSolicitante, filterSituacao]);
+  useEffect(() => { lsSet(LS_SORT, { key: sortKey, dir: sortDir }); }, [sortKey, sortDir]);
 
   useEffect(() => {
     if (!API_URL) { setLoading(false); return; }
@@ -302,19 +355,19 @@ export default function App() {
       .finally(() => setLoading(false));
   }, []);
 
-  const showToast = (msg, type = 'success') => {
+  const showToast = useCallback((msg, type = 'success') => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 2800);
-  };
+  }, []);
 
   const solicitantes = useMemo(() => {
-    return [...new Set(items.map(i => i.solicitante).filter(Boolean))].sort();
+    return [...new Set(items.map(i => i.solicitante).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'pt-BR'));
   }, [items]);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     const match = (it) => {
-      if (q && !it.descricao.toLowerCase().includes(q) && !String(it.id).includes(q)) return false;
+      if (q && !(it.descricao || '').toLowerCase().includes(q) && !String(it.id).includes(q)) return false;
       if (filterStatus.size > 0 && !filterStatus.has(normalizeStatus(it.status))) return false;
       if (filterPrioridade.size > 0 && !filterPrioridade.has(it.prioridade)) return false;
       if (filterSolicitante.size > 0 && !filterSolicitante.has(it.solicitante || '(sem)')) return false;
@@ -329,21 +382,19 @@ export default function App() {
     items.forEach(it => {
       if (match(it)) {
         keep.add(it.id);
-        // sobe pra tarefa principal
         if (idLevel(it.id) >= 1) {
           const parts = String(it.id).split('.');
           for (let l = 1; l < parts.length; l++) {
             keep.add(parts.slice(0, l).join('.'));
           }
         }
-        // desce pra subtarefas
         if (idLevel(it.id) === 0) {
           items.filter(s => String(s.id).startsWith(it.id + '.')).forEach(s => keep.add(s.id));
         }
       }
     });
     return items.filter(it => keep.has(it.id));
-  }, [items, search, filterStatus, filterPrioridade, filterSolicitante, filterSituacao]);
+  }, [items, debouncedSearch, filterStatus, filterPrioridade, filterSolicitante, filterSituacao]);
 
   const hierarchical = useMemo(() => sortWithHierarchy(filtered, sortKey, sortDir), [filtered, sortKey, sortDir]);
 
@@ -356,6 +407,20 @@ export default function App() {
       return true;
     });
   }, [hierarchical, collapsed]);
+
+  // Resumo no header
+  const summary = useMemo(() => {
+    let done = 0, doing = 0, todo = 0, late = 0;
+    items.forEach(i => {
+      const st = normalizeStatus(i.status);
+      if (st === 'Concluído') done++;
+      else if (st === 'Em andamento') doing++;
+      else if (st === 'Não iniciado') todo++;
+      const sit = getSituacao(i);
+      if (sit?.kind === 'atrasada') late++;
+    });
+    return { done, doing, todo, late };
+  }, [items]);
 
   // Progresso — exclui canceladas da contagem
   const getProgress = useCallback((taskId) => {
@@ -385,45 +450,84 @@ export default function App() {
     }
   };
 
+  // Optimistic update com rollback em caso de erro
   const handleStatusChange = async (item, newStatus) => {
+    if (newStatus === normalizeStatus(item.status)) return;
+    const prevItems = items;
     const updated = { ...item, status: newStatus };
     setItems(prev => prev.map(i => i.id === item.id ? updated : i));
-    try { await api.update(updated); showToast(`Status: ${newStatus}`); }
-    catch { showToast('Erro ao salvar', 'error'); }
+    try {
+      await api.update(updated);
+      showToast(`Status: ${newStatus}`);
+    } catch {
+      setItems(prevItems); // rollback
+      showToast('Erro ao salvar status', 'error');
+    }
   };
 
   const handleFieldUpdate = async (item, field, value) => {
+    // Evita chamada à API se o valor não mudou
+    if ((item[field] || '') === (value || '')) {
+      setEditing(null);
+      return;
+    }
+    const prevItems = items;
     const updated = { ...item, [field]: value };
     setItems(prev => prev.map(i => i.id === item.id ? updated : i));
     setEditing(null);
-    try { await api.update(updated); showToast('Campo atualizado'); }
-    catch { showToast('Erro ao salvar', 'error'); }
+    try {
+      await api.update(updated);
+      showToast('Campo atualizado');
+    } catch {
+      setItems(prevItems); // rollback
+      showToast('Erro ao salvar', 'error');
+    }
   };
 
   const handleSave = async (data) => {
     const normalized = { ...data, status: normalizeStatus(data.status) };
     if (modal.mode === 'create') {
-      const id = idLevel(data.idPrincipal || '') >= 0 && data.idPrincipal
+      // FIX: lógica clara — se tem idPrincipal, é subtarefa
+      const id = data.idPrincipal
         ? nextSubId(items, data.idPrincipal)
         : nextMainId(items);
       const novo = { ...normalized, id };
+      const prevItems = items;
       setItems(prev => [...prev, novo]);
-      try { await api.create(novo); showToast('Tarefa criada'); }
-      catch { showToast('Erro no servidor', 'error'); }
+      try {
+        await api.create(novo);
+        showToast('Tarefa criada');
+      } catch {
+        setItems(prevItems);
+        showToast('Erro no servidor', 'error');
+      }
     } else {
+      const prevItems = items;
       setItems(prev => prev.map(i => i.id === normalized.id ? normalized : i));
-      try { await api.update(normalized); showToast('Salvo'); }
-      catch { showToast('Erro no servidor', 'error'); }
+      try {
+        await api.update(normalized);
+        showToast('Salvo');
+      } catch {
+        setItems(prevItems);
+        showToast('Erro no servidor', 'error');
+      }
     }
     setModal(null);
   };
 
+  // FIX: deleta em paralelo via Promise.all (mais rápido)
   const handleDelete = async (item) => {
     const ids = new Set([item.id]);
     items.filter(i => String(i.id).startsWith(item.id + '.')).forEach(s => ids.add(s.id));
+    const prevItems = items;
     setItems(prev => prev.filter(i => !ids.has(i.id)));
-    try { for (const id of ids) await api.remove(id); showToast(`Excluído`); }
-    catch { showToast('Erro ao excluir', 'error'); }
+    try {
+      await Promise.all([...ids].map(id => api.remove(id)));
+      showToast(`Excluído`);
+    } catch {
+      setItems(prevItems);
+      showToast('Erro ao excluir', 'error');
+    }
     setConfirmDel(null);
   };
 
@@ -431,12 +535,14 @@ export default function App() {
     const headers = ['ID', 'Tipo', 'ID Principal', 'Descrição', 'Prioridade', 'Status', 'Data Solic.', 'Data Prazo', 'Dias Restantes', 'Situação', 'Solicitante'];
     const rows = sortWithHierarchy(items, 'id', 'asc').map(i => {
       const sit = getSituacao(i);
+      const st = normalizeStatus(i.status);
+      const isDone = st === 'Concluído' || st === 'Cancelado';
       return [
-        i.id, i.tipo, i.idPrincipal || '', i.descricao, i.prioridade, i.status,
+        i.id, i.tipo || '', i.idPrincipal || '', i.descricao || '', i.prioridade || '', st,
         cleanDate(i.dataSolic), cleanDate(i.dataPrazo),
-        daysUntil(i.dataPrazo) ?? '',
+        isDone ? '' : (daysUntil(i.dataPrazo) ?? ''), // FIX: não exporta dias para itens fechados
         sit ? sit.kind : '',
-        i.solicitante
+        i.solicitante || ''
       ].map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',');
     });
     const csv = [headers.join(','), ...rows].join('\n');
@@ -454,7 +560,12 @@ export default function App() {
       setSortDir(d => d === 'asc' ? 'desc' : 'asc');
     } else {
       setSortKey(key);
-      setSortDir(key === 'id' ? 'desc' : key === 'diasRestantes' ? 'asc' : 'asc');
+      // Padrões inteligentes por coluna
+      if (key === 'id') setSortDir('desc');
+      else if (key === 'diasRestantes') setSortDir('asc'); // mais urgentes primeiro
+      else if (key === 'dataPrazo') setSortDir('asc');     // mais próximos primeiro
+      else if (key === 'prioridade') setSortDir('asc');    // Alta primeiro
+      else setSortDir('asc');
     }
   };
 
@@ -466,10 +577,37 @@ export default function App() {
   const anyFilter = search || filterStatus.size || filterPrioridade.size || filterSolicitante.size || filterSituacao.size;
   const tarefasPrincipais = items.filter(i => idLevel(i.id) === 0);
 
-  // Abre modal de nova tarefa com foco automático no campo descrição
   const openNewTask = (defaults = { tipo: 'Tarefa' }) => {
     setModal({ mode: 'create', defaults, autoFocus: true });
   };
+
+  // Atalhos de teclado (N = nova tarefa, / = focar busca, Esc = fechar modal)
+  useEffect(() => {
+    const handler = (e) => {
+      // Ignora se está digitando em input/textarea/select
+      const tag = e.target.tagName?.toLowerCase();
+      const editable = ['input', 'textarea', 'select'].includes(tag) || e.target.isContentEditable;
+
+      if (e.key === 'Escape') {
+        if (modal) setModal(null);
+        else if (confirmDel) setConfirmDel(null);
+        else if (editing) setEditing(null);
+        return;
+      }
+
+      if (editable) return;
+
+      if (e.key === '/' && !modal && !confirmDel) {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      } else if ((e.key === 'n' || e.key === 'N') && !modal && !confirmDel && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        openNewTask();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [modal, confirmDel, editing]);
 
   return (
     <div className="min-h-screen font-body text-stone-900" style={{
@@ -483,14 +621,8 @@ export default function App() {
         @keyframes fadeInUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
         @keyframes pulse-ring { 0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,.5); } 50% { box-shadow: 0 0 0 6px rgba(239,68,68,0); } }
-        @keyframes creditShine {
-          0% { background-position: -200% center; }
-          100% { background-position: 200% center; }
-        }
-        @keyframes creditFloat {
-          0%, 100% { transform: translateY(0px); }
-          50% { transform: translateY(-3px); }
-        }
+        @keyframes creditShine { 0% { background-position: -200% center; } 100% { background-position: 200% center; } }
+        @keyframes creditFloat { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-3px); } }
         .row-appear { animation: fadeInUp 0.3s ease-out backwards; }
         .shimmer-load { background: linear-gradient(90deg, #f5f5f4 25%, #e7e5e4 50%, #f5f5f4 75%); background-size: 200% 100%; animation: shimmer 1.4s infinite; }
         .atrasada-pulse { animation: pulse-ring 2s infinite; }
@@ -506,9 +638,12 @@ export default function App() {
           animation: creditShine 3s linear infinite, creditFloat 2.5s ease-in-out infinite;
           display: inline-block;
         }
-        /* Largura fixa para todos os chips de status */
         .status-chip-fixed { min-width: 116px; display: inline-flex; justify-content: center; white-space: nowrap; }
-        /* Dropdown de filtro acima da tabela — posicionado via JS com position:fixed */
+        kbd {
+          display: inline-block; padding: 1px 5px; font-size: 10px; font-family: ui-monospace, monospace;
+          color: #475569; background: #f1f5f9; border: 1px solid #e2e8f0; border-bottom-width: 2px;
+          border-radius: 4px; line-height: 1;
+        }
       `}</style>
 
       <Header
@@ -517,12 +652,14 @@ export default function App() {
         onToggleAll={toggleAll}
         allCollapsed={allCollapsed}
         total={items.length}
+        summary={summary}
         view={view}
         setView={setView}
       />
 
       <main className="max-w-[1600px] mx-auto px-6 py-6">
         <Toolbar
+          searchInputRef={searchInputRef}
           search={search} setSearch={setSearch}
           filterStatus={filterStatus} setFilterStatus={setFilterStatus}
           filterPrioridade={filterPrioridade} setFilterPrioridade={setFilterPrioridade}
@@ -533,7 +670,7 @@ export default function App() {
         />
 
         {view === 'gantt' ? (
-          <GanttView items={items} onToggleAll={toggleAll} allCollapsed={allCollapsed} />
+          <GanttView items={items} />
         ) : (
           <div className="bg-white/70 backdrop-blur-xl border border-stone-200/80 rounded-2xl overflow-hidden shadow-sm grain">
             <div className="overflow-x-auto">
@@ -546,7 +683,14 @@ export default function App() {
                       <div className="flex flex-col items-center gap-2">
                         <Sparkles className="w-6 h-6 text-stone-300" />
                         <span className="font-serif-display text-xl italic">Nada por aqui</span>
-                        <span className="text-xs">Nenhuma demanda encontrada com os filtros aplicados</span>
+                        <span className="text-xs">
+                          {anyFilter ? 'Nenhuma demanda encontrada com os filtros aplicados' : 'Crie sua primeira demanda'}
+                        </span>
+                        {anyFilter && (
+                          <button onClick={clearFilters} className="mt-2 text-xs text-slate-700 hover:text-slate-900 underline">
+                            Limpar filtros
+                          </button>
+                        )}
                       </div>
                     </td></tr>
                   )}
@@ -567,17 +711,20 @@ export default function App() {
                       solicitantes={solicitantes}
                       getProgress={getProgress}
                       rowIndex={idx}
-                      isLast={idx >= visibleRows.length - 3}
+                      isLast={idx >= visibleRows.length - 3 && visibleRows.length > 5}
                     />
                   ))}
                 </tbody>
               </table>
             </div>
             <div className="px-5 py-3 border-t border-stone-200/80 text-xs text-stone-500 flex items-center justify-between bg-gradient-to-r from-stone-50/80 to-white/80">
-              <span className="flex items-center gap-2">
+              <span className="flex items-center gap-2 flex-wrap">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
                 {visibleRows.length} de {items.length} {items.length === 1 ? 'item' : 'itens'}
                 {anyFilter && <span className="text-stone-400">· filtros ativos</span>}
+                <span className="hidden sm:inline text-stone-400 ml-2">
+                  · <kbd>N</kbd> nova · <kbd>/</kbd> buscar · <kbd>Esc</kbd> fechar
+                </span>
               </span>
               <span className="text-stone-400 text-[10px] uppercase tracking-widest">
                 {API_URL ? 'Sincronizado · Google Sheets' : 'Modo local'}
@@ -586,7 +733,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Crédito animado */}
         <div className="mt-8 text-center py-4">
           <span className="credit-shine text-sm font-semibold tracking-wider">
             ✦ Sistema desenvolvido por Leandro Ramalho da Silva ✦
@@ -615,12 +761,12 @@ export default function App() {
 }
 
 // ============================================================================
-// HEADER
+// HEADER — agora com chips de resumo
 // ============================================================================
-function Header({ onExport, onNew, onToggleAll, allCollapsed, total, view, setView }) {
+function Header({ onExport, onNew, onToggleAll, allCollapsed, total, summary, view, setView }) {
   return (
     <header className="sticky top-0 z-30 bg-white/80 backdrop-blur-2xl border-b border-stone-200/60">
-      <div className="max-w-[1600px] mx-auto px-6 py-5 flex items-center justify-between">
+      <div className="max-w-[1600px] mx-auto px-6 py-5 flex items-center justify-between gap-4 flex-wrap">
         <div className="flex items-center gap-4">
           <div className="relative">
             <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-slate-900 via-slate-800 to-slate-700 flex items-center justify-center text-white shadow-lg shadow-slate-900/20">
@@ -634,34 +780,55 @@ function Header({ onExport, onNew, onToggleAll, allCollapsed, total, view, setVi
               <span className="tabular-nums">{total}</span> itens · atualizações em tempo real
             </p>
           </div>
+
+          {/* Chips de resumo — só aparecem se houver itens */}
+          {total > 0 && (
+            <div className="hidden lg:flex items-center gap-1.5 ml-4 pl-4 border-l border-stone-200">
+              {summary.late > 0 && (
+                <span className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-bold bg-red-100 text-red-800 rounded-md ring-1 ring-red-300">
+                  <AlertTriangle className="w-3 h-3" /> {summary.late} atrasada{summary.late > 1 ? 's' : ''}
+                </span>
+              )}
+              <span className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold bg-sky-50 text-sky-700 rounded-md ring-1 ring-sky-200">
+                <CircleDashed className="w-3 h-3" /> {summary.doing}
+              </span>
+              <span className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold bg-amber-50 text-amber-800 rounded-md ring-1 ring-amber-200">
+                <Clock className="w-3 h-3" /> {summary.todo}
+              </span>
+              <span className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold bg-emerald-50 text-emerald-700 rounded-md ring-1 ring-emerald-200">
+                <CheckCircle2 className="w-3 h-3" /> {summary.done}
+              </span>
+            </div>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Toggle de visão */}
           <div className="flex items-center bg-stone-100 rounded-lg p-1 gap-1">
             <button
               onClick={() => setView('table')}
               className={`text-xs font-semibold px-3 py-1.5 rounded-md flex items-center gap-1.5 transition-all ${view === 'table' ? 'bg-white text-slate-900 shadow-sm' : 'text-stone-500 hover:text-slate-700'}`}
+              aria-label="Visualização em tabela"
             >
               <BarChart2 className="w-3.5 h-3.5" /> Tabela
             </button>
             <button
               onClick={() => setView('gantt')}
               className={`text-xs font-semibold px-3 py-1.5 rounded-md flex items-center gap-1.5 transition-all ${view === 'gantt' ? 'bg-white text-slate-900 shadow-sm' : 'text-stone-500 hover:text-slate-700'}`}
+              aria-label="Visualização em Gantt"
             >
               <GanttChart className="w-3.5 h-3.5" /> Gantt
             </button>
           </div>
 
-          <button onClick={onToggleAll} className="text-sm text-stone-600 hover:text-slate-900 px-3 py-2 rounded-lg hover:bg-stone-100 flex items-center gap-2 transition-all font-medium" title={allCollapsed ? 'Expandir todas' : 'Recolher todas'}>
+          <button onClick={onToggleAll} className="text-sm text-stone-600 hover:text-slate-900 px-3 py-2 rounded-lg hover:bg-stone-100 flex items-center gap-2 transition-all font-medium" title={allCollapsed ? 'Expandir todas' : 'Recolher todas'} aria-label={allCollapsed ? 'Expandir todas as tarefas' : 'Recolher todas as tarefas'}>
             {allCollapsed ? <Expand className="w-4 h-4" /> : <Minimize2 className="w-4 h-4" />}
             <span className="hidden md:inline">{allCollapsed ? 'Expandir' : 'Recolher'}</span>
           </button>
-          <button onClick={onExport} className="text-sm text-stone-600 hover:text-slate-900 px-3 py-2 rounded-lg hover:bg-stone-100 flex items-center gap-2 transition-all font-medium">
+          <button onClick={onExport} className="text-sm text-stone-600 hover:text-slate-900 px-3 py-2 rounded-lg hover:bg-stone-100 flex items-center gap-2 transition-all font-medium" aria-label="Exportar CSV">
             <Download className="w-4 h-4" />
             <span className="hidden md:inline">Exportar</span>
           </button>
-          <button onClick={onNew} className="bg-gradient-to-br from-slate-900 to-slate-800 hover:from-slate-800 hover:to-slate-700 text-white text-sm font-semibold px-4 py-2.5 rounded-lg flex items-center gap-2 transition-all shadow-md shadow-slate-900/20 hover:shadow-lg hover:shadow-slate-900/30 hover:-translate-y-0.5">
+          <button onClick={onNew} className="bg-gradient-to-br from-slate-900 to-slate-800 hover:from-slate-800 hover:to-slate-700 text-white text-sm font-semibold px-4 py-2.5 rounded-lg flex items-center gap-2 transition-all shadow-md shadow-slate-900/20 hover:shadow-lg hover:shadow-slate-900/30 hover:-translate-y-0.5" title="Nova tarefa (atalho: N)">
             <Plus className="w-4 h-4" strokeWidth={2.5} /> Nova Tarefa
           </button>
         </div>
@@ -673,18 +840,29 @@ function Header({ onExport, onNew, onToggleAll, allCollapsed, total, view, setVi
 // ============================================================================
 // TOOLBAR
 // ============================================================================
-function Toolbar({ search, setSearch, filterStatus, setFilterStatus, filterPrioridade, setFilterPrioridade, filterSolicitante, setFilterSolicitante, filterSituacao, setFilterSituacao, solicitantes, onClear, anyFilter }) {
+function Toolbar({ searchInputRef, search, setSearch, filterStatus, setFilterStatus, filterPrioridade, setFilterPrioridade, filterSolicitante, setFilterSolicitante, filterSituacao, setFilterSituacao, solicitantes, onClear, anyFilter }) {
   return (
     <div className="bg-white/70 backdrop-blur-xl border border-stone-200/80 rounded-2xl p-3 mb-4 flex flex-wrap items-center gap-2 shadow-sm">
       <div className="relative flex-1 min-w-[240px]">
         <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-stone-400" />
         <input
+          ref={searchInputRef}
           type="text"
           value={search}
           onChange={e => setSearch(e.target.value)}
-          placeholder="Buscar por descrição ou ID..."
-          className="w-full pl-10 pr-3 py-2.5 text-sm border border-stone-200/80 rounded-xl focus:outline-none focus:ring-2 focus:ring-slate-900/10 focus:border-slate-400 bg-stone-50/80 placeholder:text-stone-400"
+          placeholder="Buscar por descrição ou ID...  ( / )"
+          className="w-full pl-10 pr-9 py-2.5 text-sm border border-stone-200/80 rounded-xl focus:outline-none focus:ring-2 focus:ring-slate-900/10 focus:border-slate-400 bg-stone-50/80 placeholder:text-stone-400"
+          aria-label="Buscar demandas"
         />
+        {search && (
+          <button
+            onClick={() => setSearch('')}
+            className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded hover:bg-stone-200 text-stone-400 hover:text-stone-700"
+            aria-label="Limpar busca"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        )}
       </div>
 
       <MultiSelectFilter icon={CircleDashed} label="Status" values={filterStatus} setValues={setFilterStatus}
@@ -718,14 +896,31 @@ function MultiSelectFilter({ icon: Icon, label, values, setValues, options }) {
   const btnRef = useRef(null);
   const dropRef = useRef(null);
 
-  // Calcula posição do dropdown baseado no botão (position: fixed sai do stacking context da tabela)
-  const handleOpen = () => {
-    if (!open && btnRef.current) {
+  const recomputePos = useCallback(() => {
+    if (btnRef.current) {
       const rect = btnRef.current.getBoundingClientRect();
       setDropdownPos({ top: rect.bottom + 6, left: rect.left });
     }
+  }, []);
+
+  const handleOpen = () => {
+    if (!open) recomputePos();
     setOpen(o => !o);
   };
+
+  // FIX: recalcula posição em scroll/resize enquanto aberto
+  useEffect(() => {
+    if (!open) return;
+    recomputePos();
+    const onScroll = () => recomputePos();
+    const onResize = () => recomputePos();
+    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('resize', onResize);
+    return () => {
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('resize', onResize);
+    };
+  }, [open, recomputePos]);
 
   useEffect(() => {
     const h = (e) => {
@@ -736,6 +931,14 @@ function MultiSelectFilter({ icon: Icon, label, values, setValues, options }) {
     };
     if (open) document.addEventListener('mousedown', h);
     return () => document.removeEventListener('mousedown', h);
+  }, [open]);
+
+  // Fecha com Esc
+  useEffect(() => {
+    if (!open) return;
+    const h = (e) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('keydown', h);
+    return () => document.removeEventListener('keydown', h);
   }, [open]);
 
   const toggle = (v) => {
@@ -754,6 +957,8 @@ function MultiSelectFilter({ icon: Icon, label, values, setValues, options }) {
         ref={btnRef}
         onClick={handleOpen}
         className={`text-sm border rounded-xl px-3 py-2.5 bg-white/80 hover:bg-white flex items-center gap-2 transition-all font-medium ${count > 0 ? 'border-slate-900 text-slate-900' : 'border-stone-200 text-stone-600'}`}
+        aria-haspopup="listbox"
+        aria-expanded={open}
       >
         <Icon className="w-3.5 h-3.5" />
         <span>{label}</span>
@@ -764,7 +969,8 @@ function MultiSelectFilter({ icon: Icon, label, values, setValues, options }) {
         <div
           ref={dropRef}
           style={{ position: 'fixed', top: dropdownPos.top, left: dropdownPos.left, zIndex: 99999 }}
-          className="bg-white border border-stone-200 rounded-xl shadow-2xl min-w-[200px] overflow-hidden"
+          className="bg-white border border-stone-200 rounded-xl shadow-2xl min-w-[200px] max-h-[60vh] overflow-y-auto"
+          role="listbox"
         >
           <div className="p-1.5">
             {options.map(opt => {
@@ -774,17 +980,19 @@ function MultiSelectFilter({ icon: Icon, label, values, setValues, options }) {
                   key={opt.value}
                   onClick={() => toggle(opt.value)}
                   className={`w-full text-left px-2.5 py-2 text-sm flex items-center gap-2.5 rounded-lg transition-colors ${active ? 'bg-slate-100 text-slate-900 font-medium' : 'hover:bg-stone-50 text-stone-700'}`}
+                  role="option"
+                  aria-selected={active}
                 >
-                  <div className={`w-4 h-4 rounded-md border flex items-center justify-center transition-all ${active ? 'bg-slate-900 border-slate-900' : 'border-stone-300'}`}>
+                  <div className={`w-4 h-4 rounded-md border flex items-center justify-center transition-all flex-shrink-0 ${active ? 'bg-slate-900 border-slate-900' : 'border-stone-300'}`}>
                     {active && <Check className="w-3 h-3 text-white" strokeWidth={3} />}
                   </div>
-                  {opt.label}
+                  <span className="truncate">{opt.label}</span>
                 </button>
               );
             })}
           </div>
           {count > 0 && (
-            <div className="border-t border-stone-100 p-1.5">
+            <div className="border-t border-stone-100 p-1.5 sticky bottom-0 bg-white">
               <button onClick={() => setValues(new Set())} className="w-full text-left px-2.5 py-1.5 text-xs text-stone-500 hover:bg-stone-50 rounded-md">
                 Limpar seleção
               </button>
@@ -855,7 +1063,7 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
   const style = STATUS_STYLE[statusNorm] || STATUS_STYLE['Não iniciado'];
   const hasSubs = items.some(i => String(i.id).startsWith(item.id + '.') && idLevel(i.id) === level + 1);
   const isCollapsed = collapsed.has(item.id);
-  const situacao = getSituacao({ ...item, status: statusNorm });
+  const situacao = getSituacao(item);
   const isAtrasada = situacao?.kind === 'atrasada';
   const isDone = statusNorm === 'Concluído' || statusNorm === 'Cancelado';
   const days = daysUntil(item.dataPrazo);
@@ -877,7 +1085,6 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
     borderLeft = `border-l-4 ${style.border}`;
   }
 
-  // Fundo amarelo mais forte para Não iniciado
   if (!isSub && statusNorm === 'Não iniciado' && !isAtrasada) {
     rowBg = 'bg-amber-100/70 hover:bg-amber-100/90';
   }
@@ -886,30 +1093,30 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
 
   const indentPx = level * 24;
 
-  // Cor vermelha para textos em tarefas atrasadas (exceto status)
-  const redText = isAtrasada ? 'text-red-800' : '';
-
   return (
     <tr className={`${rowBg} ${borderLeft} border-b border-stone-200/60 transition-all group row-appear`} style={{ animationDelay: `${Math.min(rowIndex * 20, 400)}ms` }}>
       {/* Toggle */}
       <td className="py-3 px-3 align-top">
         {hasSubs && (
-          <button onClick={() => onToggle(item.id)} className="w-6 h-6 rounded-md hover:bg-white/80 flex items-center justify-center text-stone-500 transition-all">
+          <button
+            onClick={() => onToggle(item.id)}
+            className="w-6 h-6 rounded-md hover:bg-white/80 flex items-center justify-center text-stone-500 transition-all"
+            aria-label={isCollapsed ? 'Expandir subtarefas' : 'Recolher subtarefas'}
+          >
             <ChevronDown className={`w-4 h-4 chevron-smooth ${isCollapsed ? '-rotate-90' : ''}`} />
           </button>
         )}
       </td>
 
-      {/* ID — ícone de alerta à DIREITA do ID (v2 fix) */}
+      {/* ID */}
       <td className="py-3 px-3 align-top">
         <div className="flex items-center gap-1" style={{ paddingLeft: `${indentPx}px` }}>
           {isSub && <div className="w-3 h-px bg-stone-300 flex-shrink-0"></div>}
           <span className={`tabular-nums text-xs font-bold ${isAtrasada ? 'text-red-700' : isSub ? 'text-stone-500' : 'text-slate-900'}`}>
             {item.id}
           </span>
-          {/* ícone de alerta à direita do ID, sem quebrar linha */}
           {isAtrasada && !isSub && (
-            <div className="atrasada-pulse rounded-full flex-shrink-0">
+            <div className="atrasada-pulse rounded-full flex-shrink-0" title={`Atrasada há ${Math.abs(situacao.days)} dia(s)`}>
               <AlertTriangle className="w-3.5 h-3.5 text-red-600 fill-red-100" strokeWidth={2.5} />
             </div>
           )}
@@ -930,14 +1137,14 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
           </div>
         )}
         {progress && !isSub && progress.total > 0 && (
-          <div className="mt-2 flex items-center gap-2">
+          <div className="mt-2 flex items-center gap-2" title={`${progress.done} de ${progress.total} subtarefas concluídas`}>
             <div className="flex-1 h-1 bg-stone-200/60 rounded-full overflow-hidden max-w-[120px]">
               <div className="h-full bg-gradient-to-r from-emerald-400 to-emerald-500 transition-all duration-500" style={{ width: `${progress.pct}%` }} />
             </div>
             <span className="text-[10px] text-stone-500 tabular-nums font-medium">{progress.done}/{progress.total}</span>
           </div>
         )}
-        {item.observacoes && (
+        {item.observacoes && !isEditing('observacoes') && (
           <div
             onDoubleClick={() => setEditing({ id: item.id, field: 'observacoes' })}
             className={`text-xs text-stone-500 mt-1 italic line-clamp-2 cursor-text hover:bg-white/60 rounded ${isAtrasada ? 'text-red-700' : ''}`}
@@ -951,7 +1158,7 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
         )}
       </td>
 
-      {/* Prioridade — duplo clique habilitado (v2 fix) */}
+      {/* Prioridade */}
       <td className="py-3 px-3 align-top">
         {isDone ? (
           <span className="text-stone-300 text-xs">—</span>
@@ -964,7 +1171,7 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
         ) : (
           <div onDoubleClick={() => setEditing({ id: item.id, field: 'prioridade' })} title="Duplo clique para editar" className="cursor-text">
             {item.prioridade === 'Alta' ? (
-              <span className={`inline-flex items-center gap-1 px-2 py-0.5 text-xs font-bold rounded-md ring-1 bg-gradient-to-r from-red-200 to-red-100 ring-red-300 shadow-sm ${isAtrasada ? 'text-red-900' : 'text-red-900'}`}>
+              <span className={`inline-flex items-center gap-1 px-2 py-0.5 text-xs font-bold rounded-md ring-1 bg-gradient-to-r from-red-200 to-red-100 ring-red-300 shadow-sm text-red-900`}>
                 <Siren className="w-3 h-3" strokeWidth={2.5} /> Alta
               </span>
             ) : (
@@ -976,7 +1183,7 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
         )}
       </td>
 
-      {/* Status dropdown */}
+      {/* Status */}
       <td className="py-3 px-3 align-top">
         <StatusDropdown value={statusNorm} onChange={(v) => onStatusChange(item, v)} openUpward={isLast} />
       </td>
@@ -1003,7 +1210,7 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
         )}
       </td>
 
-      {/* Dias — chip em linha (v2 fix: sem quebra) */}
+      {/* Dias */}
       <td className="py-3 px-3 align-top">
         {isDone || !cleanDate(item.dataPrazo) ? (
           <span className="text-stone-300 text-xs">—</span>
@@ -1017,24 +1224,25 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
         {isEditing('solicitante') ? (
           <InlineText initial={item.solicitante || ''} onCommit={(v) => onFieldUpdate(item, 'solicitante', v)} onCancel={() => setEditing(null)} list={solicitantes} />
         ) : item.solicitante ? (
-          <div onDoubleClick={() => setEditing({ id: item.id, field: 'solicitante' })} className="inline-flex items-center gap-2 cursor-text hover:bg-white/60 rounded-lg px-1.5 py-1 -mx-1.5 transition-colors" title="Duplo clique para editar">
+          <div onDoubleClick={() => setEditing({ id: item.id, field: 'solicitante' })} className="inline-flex items-center gap-2 cursor-text hover:bg-white/60 rounded-lg px-1.5 py-1 -mx-1.5 transition-colors" title={`${item.solicitante} — duplo clique para editar`}>
             <div className={`w-6 h-6 rounded-full ${avatar.bg} ring-2 ${avatar.ring} flex items-center justify-center text-white text-[10px] font-bold shadow-sm`}>
               {avatar.initial}
             </div>
             <span className={`text-xs font-medium truncate max-w-[100px] ${isAtrasada ? 'text-red-800' : 'text-stone-700'}`}>{item.solicitante}</span>
           </div>
         ) : (
-          <span onDoubleClick={() => setEditing({ id: item.id, field: 'solicitante' })} className="text-stone-300 text-xs cursor-text">—</span>
+          <span onDoubleClick={() => setEditing({ id: item.id, field: 'solicitante' })} className="text-stone-300 text-xs cursor-text" title="Duplo clique para editar">—</span>
         )}
       </td>
 
-      {/* Ações (v2: 3 botões — +, lápis, lixeira) */}
+      {/* Ações */}
       <td className="py-3 px-3 align-top">
-        <div className="flex items-center justify-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+        <div className="flex items-center justify-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
           {!isSub && (
             <button
               onClick={onAddSub}
               title="Adicionar subtarefa"
+              aria-label="Adicionar subtarefa"
               className="w-7 h-7 rounded-lg hover:bg-sky-100 text-stone-400 hover:text-sky-600 flex items-center justify-center transition-all"
             >
               <Plus className="w-3.5 h-3.5" strokeWidth={2.5} />
@@ -1043,6 +1251,7 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
           <button
             onClick={onEdit}
             title="Editar"
+            aria-label="Editar tarefa"
             className="w-7 h-7 rounded-lg hover:bg-amber-100 text-stone-400 hover:text-amber-700 flex items-center justify-center transition-all"
           >
             <Pencil className="w-3.5 h-3.5" strokeWidth={2} />
@@ -1050,6 +1259,7 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
           <button
             onClick={onDelete}
             title="Excluir"
+            aria-label="Excluir tarefa"
             className="w-7 h-7 rounded-lg hover:bg-red-100 text-stone-400 hover:text-red-600 flex items-center justify-center transition-all"
           >
             <Trash2 className="w-3.5 h-3.5" strokeWidth={2} />
@@ -1061,7 +1271,7 @@ function Row({ item, items, collapsed, onToggle, onStatusChange, onEdit, onDelet
 }
 
 // ============================================================================
-// DIAS CHIP — tudo numa linha (v2 fix)
+// DIAS CHIP
 // ============================================================================
 function DaysChip({ days, situacao }) {
   if (days === null) return <span className="text-stone-300 text-xs">—</span>;
@@ -1089,18 +1299,29 @@ function DaysChip({ days, situacao }) {
 }
 
 // ============================================================================
-// STATUS DROPDOWN — largura fixa + ícones coloridos na seleção (v2)
+// STATUS DROPDOWN
 // ============================================================================
 function StatusDropdown({ value, onChange, openUpward }) {
   const [open, setOpen] = useState(false);
   const style = STATUS_STYLE[value] || STATUS_STYLE['Não iniciado'];
   const Icon = style.icon;
 
+  // Fecha com Esc
+  useEffect(() => {
+    if (!open) return;
+    const h = (e) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('keydown', h);
+    return () => document.removeEventListener('keydown', h);
+  }, [open]);
+
   return (
     <div className="relative">
       <button
         onClick={(e) => { e.stopPropagation(); setOpen(o => !o); }}
         className={`status-chip-fixed inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold ring-1 whitespace-nowrap ${style.chip} hover:shadow-md transition-all`}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={`Status atual: ${style.short}. Clique para alterar.`}
       >
         <Icon className="w-3 h-3 flex-shrink-0" strokeWidth={2.5} />
         <span className="flex-1 text-center">{style.short}</span>
@@ -1109,7 +1330,7 @@ function StatusDropdown({ value, onChange, openUpward }) {
       {open && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setOpen(false)}></div>
-          <div className={`absolute ${openUpward ? 'bottom-full mb-1' : 'top-full mt-1'} left-0 bg-white border border-stone-200 rounded-xl shadow-xl z-50 min-w-[180px] overflow-hidden p-1`}>
+          <div className={`absolute ${openUpward ? 'bottom-full mb-1' : 'top-full mt-1'} left-0 bg-white border border-stone-200 rounded-xl shadow-xl z-50 min-w-[180px] overflow-hidden p-1`} role="listbox">
             {STATUS_OPTIONS.map(s => {
               const st = STATUS_STYLE[s];
               const SIcon = st.icon;
@@ -1118,9 +1339,10 @@ function StatusDropdown({ value, onChange, openUpward }) {
                   key={s}
                   onClick={() => { onChange(s); setOpen(false); }}
                   className={`w-full text-left px-2.5 py-2 text-xs flex items-center gap-2 rounded-lg transition-colors ${s === value ? 'bg-stone-100 font-semibold' : 'hover:bg-stone-50'}`}
+                  role="option"
+                  aria-selected={s === value}
                 >
                   <span className={`w-2 h-2 rounded-full flex-shrink-0 ${st.dot}`}></span>
-                  {/* ícone colorido (v2: mesma cor da bolinha) */}
                   <SIcon className={`w-3.5 h-3.5 flex-shrink-0 ${st.iconColor}`} />
                   <span>{st.short}</span>
                 </button>
@@ -1134,21 +1356,27 @@ function StatusDropdown({ value, onChange, openUpward }) {
 }
 
 // ============================================================================
-// EDIÇÃO INLINE
+// EDIÇÃO INLINE — agora previne duplo commit (Enter + blur)
 // ============================================================================
 function InlineTextarea({ initial, onCommit, onCancel }) {
   const [v, setV] = useState(initial);
   const ref = useRef(null);
+  const committedRef = useRef(false); // FIX: evita duplo commit
   useEffect(() => { ref.current?.focus(); ref.current?.select(); }, []);
+  const commit = (val) => {
+    if (committedRef.current) return;
+    committedRef.current = true;
+    onCommit(val);
+  };
   return (
     <textarea
       ref={ref}
       value={v}
       onChange={e => setV(e.target.value)}
-      onBlur={() => onCommit(v)}
+      onBlur={() => commit(v)}
       onKeyDown={e => {
-        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onCommit(v); }
-        if (e.key === 'Escape') onCancel();
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commit(v); }
+        if (e.key === 'Escape') { committedRef.current = true; onCancel(); }
       }}
       rows={2}
       className="w-full text-sm border-2 border-slate-400 rounded-lg p-2 focus:outline-none focus:border-slate-900 resize-none bg-white shadow-lg"
@@ -1159,13 +1387,22 @@ function InlineTextarea({ initial, onCommit, onCancel }) {
 function InlineText({ initial, onCommit, onCancel, list }) {
   const [v, setV] = useState(initial);
   const ref = useRef(null);
+  const committedRef = useRef(false);
   useEffect(() => { ref.current?.focus(); ref.current?.select(); }, []);
-  const dataListId = `dl-${Math.random().toString(36).slice(2)}`;
+  const dataListId = useMemo(() => `dl-${Math.random().toString(36).slice(2)}`, []);
+  const commit = (val) => {
+    if (committedRef.current) return;
+    committedRef.current = true;
+    onCommit(val);
+  };
   return (
     <>
       <input ref={ref} type="text" value={v} onChange={e => setV(e.target.value)}
-        onBlur={() => onCommit(v)}
-        onKeyDown={e => { if (e.key === 'Enter') onCommit(v); if (e.key === 'Escape') onCancel(); }}
+        onBlur={() => commit(v)}
+        onKeyDown={e => {
+          if (e.key === 'Enter') { e.preventDefault(); commit(v); }
+          if (e.key === 'Escape') { committedRef.current = true; onCancel(); }
+        }}
         list={list ? dataListId : undefined}
         className="w-full text-xs border-2 border-slate-400 rounded-md px-2 py-1 focus:outline-none focus:border-slate-900 bg-white shadow-md"
       />
@@ -1177,17 +1414,25 @@ function InlineText({ initial, onCommit, onCancel, list }) {
 function InlineDate({ initial, onCommit, onCancel }) {
   const [v, setV] = useState(initial);
   const ref = useRef(null);
+  const committedRef = useRef(false);
   useEffect(() => { ref.current?.focus(); }, []);
+  const commit = (val) => {
+    if (committedRef.current) return;
+    committedRef.current = true;
+    onCommit(val);
+  };
   return (
     <input ref={ref} type="date" value={v} onChange={e => setV(e.target.value)}
-      onBlur={() => onCommit(v)}
-      onKeyDown={e => { if (e.key === 'Enter') onCommit(v); if (e.key === 'Escape') onCancel(); }}
+      onBlur={() => commit(v)}
+      onKeyDown={e => {
+        if (e.key === 'Enter') { e.preventDefault(); commit(v); }
+        if (e.key === 'Escape') { committedRef.current = true; onCancel(); }
+      }}
       className="w-full text-xs border-2 border-slate-400 rounded-md px-1.5 py-1 focus:outline-none focus:border-slate-900 bg-white shadow-md"
     />
   );
 }
 
-// Edição inline de prioridade (v2 fix)
 function InlinePrioridade({ initial, onCommit, onCancel }) {
   return (
     <div className="flex gap-1">
@@ -1200,13 +1445,13 @@ function InlinePrioridade({ initial, onCommit, onCancel }) {
           {p}
         </button>
       ))}
-      <button onClick={onCancel} className="p-1 text-stone-400 hover:text-stone-600"><X className="w-3 h-3" /></button>
+      <button onClick={onCancel} className="p-1 text-stone-400 hover:text-stone-600" aria-label="Cancelar"><X className="w-3 h-3" /></button>
     </div>
   );
 }
 
 // ============================================================================
-// MODAL — autoFocus no campo descrição (v2 fix)
+// MODAL
 // ============================================================================
 function TaskModal({ mode, item, defaults, autoFocus, tarefasPrincipais, solicitantes, onClose, onSave, onRequestDelete }) {
   const [form, setForm] = useState(() => ({
@@ -1222,12 +1467,11 @@ function TaskModal({ mode, item, defaults, autoFocus, tarefasPrincipais, solicit
     id: item?.id,
   }));
   const [errors, setErrors] = useState({});
-  const descRef = useRef(null);
-
-  // autoFocus no campo descrição (v2: Enter cria a tarefa)
-  useEffect(() => {
-    if (autoFocus && descRef.current) {
-      setTimeout(() => descRef.current?.focus(), 80);
+  // FIX: callback ref ao invés de setTimeout para focar de forma confiável
+  const descCallbackRef = useCallback((node) => {
+    if (autoFocus && node) {
+      // Timeout mínimo só para garantir que o modal montou
+      requestAnimationFrame(() => node.focus());
     }
   }, [autoFocus]);
 
@@ -1244,9 +1488,9 @@ function TaskModal({ mode, item, defaults, autoFocus, tarefasPrincipais, solicit
   const handleSubmit = () => { if (validate()) onSave(form); };
   const update = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
-  // Enter no campo descrição cria a tarefa (v2)
   const handleDescKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && (e.ctrlKey || e.metaKey || mode === 'create')) {
+      // Em modo create: Enter cria. Em modo edit: só com Ctrl/Cmd+Enter (evita salvar sem querer)
       e.preventDefault();
       handleSubmit();
     }
@@ -1261,10 +1505,10 @@ function TaskModal({ mode, item, defaults, autoFocus, tarefasPrincipais, solicit
               {mode === 'create' ? <Plus className="w-4 h-4" strokeWidth={2.5} /> : <Sparkles className="w-4 h-4" />}
             </div>
             <h2 className="font-serif-display text-2xl text-slate-900">
-              {mode === 'create' ? (form.tipo === 'Subtarefa' ? 'Nova Subtarefa' : 'Nova Tarefa') : `Editar ${item.tipo}`}
+              {mode === 'create' ? (form.tipo === 'Subtarefa' ? 'Nova Subtarefa' : 'Nova Tarefa') : `Editar ${item?.tipo || 'Tarefa'}`}
             </h2>
           </div>
-          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-stone-100 text-stone-500"><X className="w-5 h-5" /></button>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-stone-100 text-stone-500" aria-label="Fechar"><X className="w-5 h-5" /></button>
         </div>
 
         <div className="px-6 py-5 space-y-4 max-h-[70vh] overflow-y-auto">
@@ -1273,7 +1517,11 @@ function TaskModal({ mode, item, defaults, autoFocus, tarefasPrincipais, solicit
               <Field label="Tipo">
                 <div className="flex rounded-lg border border-stone-200 overflow-hidden">
                   {['Tarefa', 'Subtarefa'].map(t => (
-                    <button key={t} onClick={() => update('tipo', t)} className={`flex-1 py-2 text-sm font-semibold transition-all ${form.tipo === t ? 'bg-slate-900 text-white' : 'bg-white text-stone-600 hover:bg-stone-50'}`}>{t}</button>
+                    <button
+                      key={t}
+                      onClick={() => update('tipo', t)}
+                      className={`flex-1 py-2 text-sm font-semibold transition-all ${form.tipo === t ? 'bg-slate-900 text-white' : 'bg-white text-stone-600 hover:bg-stone-50'}`}
+                    >{t}</button>
                   ))}
                 </div>
               </Field>
@@ -1281,7 +1529,7 @@ function TaskModal({ mode, item, defaults, autoFocus, tarefasPrincipais, solicit
                 <Field label="Tarefa Principal" error={errors.idPrincipal}>
                   <select value={form.idPrincipal || ''} onChange={e => update('idPrincipal', e.target.value)} className="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-slate-900/10">
                     <option value="">Selecione...</option>
-                    {tarefasPrincipais.map(t => (<option key={t.id} value={t.id}>{t.id} — {t.descricao.slice(0, 55)}{t.descricao.length > 55 ? '…' : ''}</option>))}
+                    {tarefasPrincipais.map(t => (<option key={t.id} value={t.id}>{t.id} — {(t.descricao || '').slice(0, 55)}{(t.descricao || '').length > 55 ? '…' : ''}</option>))}
                   </select>
                 </Field>
               )}
@@ -1290,13 +1538,13 @@ function TaskModal({ mode, item, defaults, autoFocus, tarefasPrincipais, solicit
 
           <Field label="Descrição *" error={errors.descricao}>
             <textarea
-              ref={descRef}
+              ref={descCallbackRef}
               value={form.descricao}
               onChange={e => update('descricao', e.target.value)}
               onKeyDown={handleDescKeyDown}
               rows={3}
               className="w-full border border-stone-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900/10 resize-none"
-              placeholder={autoFocus ? "Digite a descrição e pressione Enter para criar..." : "Descreva a demanda..."}
+              placeholder={mode === 'create' ? "Digite a descrição e pressione Enter para criar..." : "Descreva a demanda..."}
             />
           </Field>
 
@@ -1334,7 +1582,7 @@ function TaskModal({ mode, item, defaults, autoFocus, tarefasPrincipais, solicit
         </div>
 
         <div className="px-6 py-4 border-t border-stone-200 bg-gradient-to-r from-stone-50 to-white flex justify-between gap-2">
-          {mode === 'edit' && (
+          {mode === 'edit' && item && (
             <button onClick={() => { onClose(); onRequestDelete(item); }} className="px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 rounded-lg flex items-center gap-1.5">
               <Trash2 className="w-3.5 h-3.5" /> Excluir
             </button>
@@ -1360,14 +1608,14 @@ function Field({ label, error, children }) {
 }
 
 // ============================================================================
-// GANTT VIEW
+// GANTT VIEW — corrigido para 0 itens + botão "Hoje"
 // ============================================================================
 function GanttView({ items }) {
-  const [ganttMode, setGanttMode] = useState('weekly'); // 'daily' | 'weekly' | 'monthly'
+  const [ganttMode, setGanttMode] = useState('weekly');
   const [collapsedGantt, setCollapsedGantt] = useState(new Set());
   const today_d = today();
+  const scrollRef = useRef(null);
 
-  // Só tarefas com datas
   const mainTasks = useMemo(() => {
     return items.filter(i => idLevel(i.id) === 0 && (cleanDate(i.dataSolic) || cleanDate(i.dataPrazo)));
   }, [items]);
@@ -1375,13 +1623,18 @@ function GanttView({ items }) {
   const subsByParent = useMemo(() => {
     const map = {};
     items.filter(i => idLevel(i.id) === 1).forEach(s => {
-      if (!map[s.idPrincipal]) map[s.idPrincipal] = [];
-      map[s.idPrincipal].push(s);
+      const parentId = s.idPrincipal || String(s.id).split('.')[0];
+      if (!map[parentId]) map[parentId] = [];
+      map[parentId].push(s);
+    });
+    // ordena subs pelo número
+    Object.keys(map).forEach(k => {
+      map[k].sort((a, b) => parseId(a.id).sub - parseId(b.id).sub);
     });
     return map;
   }, [items]);
 
-  // Calcular período do Gantt
+  // FIX: lida com lista vazia sem gerar Infinity
   const { minDate, maxDate, days: totalDays } = useMemo(() => {
     const allDates = [];
     items.forEach(i => {
@@ -1389,23 +1642,35 @@ function GanttView({ items }) {
       if (cleanDate(i.dataPrazo)) allDates.push(new Date(cleanDate(i.dataPrazo) + 'T00:00:00'));
     });
     allDates.push(today_d);
-    const minD = new Date(Math.min(...allDates.map(d => d.getTime())));
-    const maxD = new Date(Math.max(...allDates.map(d => d.getTime())));
-    // Padding
+
+    // Filtra datas inválidas
+    const validDates = allDates.filter(d => !isNaN(d.getTime()));
+    if (validDates.length === 0) {
+      const t = today_d;
+      const min = new Date(t); min.setDate(min.getDate() - 14);
+      const max = new Date(t); max.setDate(max.getDate() + 30);
+      return { minDate: min, maxDate: max, days: 44 };
+    }
+
+    const minD = new Date(Math.min(...validDates.map(d => d.getTime())));
+    const maxD = new Date(Math.max(...validDates.map(d => d.getTime())));
     minD.setDate(minD.getDate() - 3);
     maxD.setDate(maxD.getDate() + 7);
-    const diff = Math.round((maxD - minD) / (1000 * 60 * 60 * 24));
+    const diff = Math.max(1, Math.round((maxD - minD) / (1000 * 60 * 60 * 24)));
     return { minDate: minD, maxDate: maxD, days: diff };
-  }, [items]);
+  }, [items, today_d.getTime()]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const colWidth = ganttMode === 'monthly' ? 40 : ganttMode === 'weekly' ? 24 : 20;
   const ganttWidth = totalDays * colWidth;
 
-  const dateToX = (iso) => {
-    const d = new Date(cleanDate(iso) + 'T00:00:00');
+  const dateToX = useCallback((iso) => {
+    const c = cleanDate(iso);
+    if (!c) return 0;
+    const d = new Date(c + 'T00:00:00');
+    if (isNaN(d.getTime())) return 0;
     const diff = Math.round((d - minDate) / (1000 * 60 * 60 * 24));
     return diff * colWidth;
-  };
+  }, [minDate, colWidth]);
 
   const todayX = dateToX(today_d.toISOString().slice(0, 10));
 
@@ -1426,20 +1691,14 @@ function GanttView({ items }) {
     const x = dateToX(start);
     const endX = dateToX(end) + colWidth;
     const width = Math.max(endX - x, colWidth);
-
-    // Se atrasada, a parte em vermelho é só no período de atraso
-    const s = normalizeStatus(item.status);
-    const sit = getSituacao(item);
-    const isAtrasada = sit?.kind === 'atrasada';
-
-    return { x, width, isAtrasada, start, end };
+    return { x, width, start, end };
   };
 
-  // Gerar labels do header
   const headerLabels = useMemo(() => {
     const labels = [];
     if (ganttMode === 'monthly') {
       let cur = new Date(minDate);
+      cur.setDate(1); // sempre começa no primeiro do mês
       while (cur <= maxDate) {
         const x = Math.round((cur - minDate) / (1000 * 60 * 60 * 24)) * colWidth;
         labels.push({ x, label: `${cur.getMonth() + 1}/${cur.getFullYear().toString().slice(2)}` });
@@ -1447,7 +1706,6 @@ function GanttView({ items }) {
       }
     } else if (ganttMode === 'weekly') {
       let cur = new Date(minDate);
-      // Ir para segunda-feira mais próxima
       const day = cur.getDay();
       if (day !== 1) cur.setDate(cur.getDate() + (day === 0 ? 1 : 8 - day));
       while (cur <= maxDate) {
@@ -1472,7 +1730,6 @@ function GanttView({ items }) {
 
   const ROW_H = 40;
 
-  // Build rows
   const rows = [];
   mainTasks.forEach(task => {
     rows.push({ ...task, isMain: true });
@@ -1481,10 +1738,26 @@ function GanttView({ items }) {
     }
   });
 
+  // Botão "Hoje" — scrolla até a data de hoje
+  const scrollToToday = () => {
+    if (scrollRef.current) {
+      const containerWidth = scrollRef.current.clientWidth;
+      const target = Math.max(0, todayX - containerWidth / 3);
+      scrollRef.current.scrollTo({ left: target, behavior: 'smooth' });
+    }
+  };
+
+  // Auto-scroll para hoje na primeira renderização
+  useEffect(() => {
+    if (mainTasks.length > 0) {
+      const t = setTimeout(scrollToToday, 100);
+      return () => clearTimeout(t);
+    }
+  }, [mainTasks.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <div className="bg-white/70 backdrop-blur-xl border border-stone-200/80 rounded-2xl overflow-hidden shadow-sm">
-      {/* Gantt controls */}
-      <div className="flex items-center gap-3 px-5 py-3 border-b border-stone-200/80 bg-gradient-to-r from-stone-50/80 to-white/80">
+      <div className="flex items-center gap-3 px-5 py-3 border-b border-stone-200/80 bg-gradient-to-r from-stone-50/80 to-white/80 flex-wrap">
         <span className="text-xs font-semibold text-stone-500 uppercase tracking-wider">Visualização</span>
         <div className="flex bg-stone-100 rounded-lg p-0.5 gap-0.5">
           {[['daily', 'Diário'], ['weekly', 'Semanal'], ['monthly', 'Mensal']].map(([k, l]) => (
@@ -1497,17 +1770,32 @@ function GanttView({ items }) {
             </button>
           ))}
         </div>
-        <span className="text-xs text-stone-400 ml-auto">Clique ▶ para expandir/recolher subtarefas</span>
+        <button
+          onClick={scrollToToday}
+          className="text-xs font-semibold px-3 py-1.5 rounded-md bg-red-50 text-red-700 hover:bg-red-100 transition-all flex items-center gap-1.5"
+          title="Centralizar em hoje"
+        >
+          <CalendarDays className="w-3.5 h-3.5" /> Hoje
+        </button>
+        <span className="text-xs text-stone-400 ml-auto">Clique ▶ para expandir/recolher</span>
       </div>
 
-      <div className="overflow-x-auto">
+      {mainTasks.length === 0 ? (
+        <div className="text-center py-20 text-stone-400">
+          <div className="flex flex-col items-center gap-2">
+            <GanttChart className="w-8 h-8 text-stone-300" />
+            <span className="font-serif-display text-xl italic">Sem tarefas datadas</span>
+            <span className="text-xs">Adicione datas de solicitação ou prazo às tarefas para visualizá-las aqui</span>
+          </div>
+        </div>
+      ) : (
         <div className="flex">
-          {/* Coluna de labels */}
-          <div className="flex-shrink-0 w-56 border-r border-stone-200/80">
+          {/* Coluna esquerda fixa (não rola junto com a grade) */}
+          <div className="flex-shrink-0 w-56 border-r border-stone-200/80 bg-white">
             <div className="h-10 border-b border-stone-200/80 bg-stone-50/80 flex items-center px-3">
               <span className="text-[11px] font-semibold text-stone-500 uppercase tracking-wider">Tarefa</span>
             </div>
-            {rows.map((row, i) => {
+            {rows.map((row) => {
               const hasSubs = !!(subsByParent[row.id]?.length);
               return (
                 <div
@@ -1515,7 +1803,7 @@ function GanttView({ items }) {
                   className={`flex items-center gap-2 px-3 border-b border-stone-100 ${row.isMain ? 'bg-stone-50/60' : 'bg-white/40'}`}
                   style={{ height: ROW_H }}
                 >
-                  {row.isMain && hasSubs && (
+                  {row.isMain && hasSubs ? (
                     <button
                       onClick={() => setCollapsedGantt(prev => {
                         const n = new Set(prev);
@@ -1523,12 +1811,17 @@ function GanttView({ items }) {
                         return n;
                       })}
                       className="w-4 h-4 flex items-center justify-center text-stone-400 hover:text-slate-700 flex-shrink-0"
+                      aria-label="Expandir/recolher subtarefas"
                     >
                       <ChevronDown className={`w-3 h-3 chevron-smooth ${collapsedGantt.has(row.id) ? '-rotate-90' : ''}`} />
                     </button>
+                  ) : (
+                    <div className="w-4 flex-shrink-0" />
                   )}
-                  {(!row.isMain || !hasSubs) && <div className="w-4 flex-shrink-0" />}
-                  <span className={`text-xs truncate ${row.isMain ? 'font-semibold text-slate-800' : 'text-stone-500 pl-3'}`} title={row.descricao}>
+                  <span
+                    className={`text-xs truncate ${row.isMain ? 'font-semibold text-slate-800' : 'text-stone-500 pl-3'}`}
+                    title={`${row.id} — ${row.descricao}`}
+                  >
                     <span className="text-stone-400 mr-1">{row.id}</span>{row.descricao}
                   </span>
                 </div>
@@ -1536,10 +1829,9 @@ function GanttView({ items }) {
             })}
           </div>
 
-          {/* Área do Gantt */}
-          <div className="overflow-x-auto flex-1">
+          {/* Área do Gantt — rolável horizontalmente */}
+          <div ref={scrollRef} className="overflow-x-auto flex-1">
             <div style={{ width: ganttWidth, minWidth: '100%', position: 'relative' }}>
-              {/* Header de datas */}
               <div className="h-10 border-b border-stone-200/80 bg-stone-50/80 relative" style={{ width: ganttWidth }}>
                 {headerLabels.map((lbl, i) => (
                   <div key={i} className="absolute top-0 flex flex-col items-start justify-center h-full" style={{ left: lbl.x }}>
@@ -1547,54 +1839,46 @@ function GanttView({ items }) {
                     <span className="text-[10px] text-stone-500 font-medium pl-1 select-none">{lbl.label}</span>
                   </div>
                 ))}
-                {/* Linha de hoje */}
                 <div className="absolute top-0 bottom-0 border-l-2 border-red-400" style={{ left: todayX }}>
                   <span className="absolute top-1 left-1 text-[9px] font-bold text-red-500 whitespace-nowrap">Hoje</span>
                 </div>
               </div>
 
-              {/* Linhas das tarefas */}
-              {rows.map((row, i) => {
+              {rows.map((row) => {
                 const barInfo = getBarStyle(row);
                 const s = normalizeStatus(row.status);
-                const sit = getSituacao({ ...row, status: s });
+                const sit = getSituacao(row);
                 return (
                   <div key={row.id} className={`relative border-b border-stone-100 ${row.isMain ? 'bg-stone-50/30' : 'bg-white/20'}`} style={{ height: ROW_H, width: ganttWidth }}>
-                    {/* Hoje marker */}
                     <div className="absolute top-0 bottom-0 border-l border-red-200" style={{ left: todayX }}></div>
 
                     {barInfo && (
-                      <>
-                        {/* Barra principal */}
-                        <div
-                          className={`absolute rounded-md ${getBarColor(row)} opacity-80 hover:opacity-100 transition-opacity cursor-default`}
-                          style={{
-                            left: barInfo.x,
-                            width: barInfo.width,
-                            top: row.isMain ? 8 : 12,
-                            height: row.isMain ? 22 : 16,
-                          }}
-                          title={`${row.id} — ${row.descricao}: ${fmtDate(barInfo.start)} → ${fmtDate(barInfo.end)}`}
-                        >
-                          {/* Parte de atraso em vermelho */}
-                          {sit?.kind === 'atrasada' && s !== 'Concluído' && s !== 'Cancelado' && (() => {
-                            const todayX2 = dateToX(today_d.toISOString().slice(0, 10));
-                            const endX = barInfo.x + barInfo.width;
-                            const delayStart = Math.max(barInfo.x, todayX2);
-                            const delayWidth = endX - delayStart;
-                            if (delayWidth <= 0) return null;
-                            return (
-                              <div
-                                className="absolute top-0 bottom-0 rounded-r-md bg-red-600"
-                                style={{ left: delayStart - barInfo.x, width: delayWidth }}
-                              />
-                            );
-                          })()}
-                          <span className="absolute inset-0 flex items-center px-1.5 overflow-hidden">
-                            <span className="text-white text-[10px] font-semibold truncate drop-shadow">{row.id}</span>
-                          </span>
-                        </div>
-                      </>
+                      <div
+                        className={`absolute rounded-md ${getBarColor(row)} opacity-80 hover:opacity-100 transition-opacity cursor-default`}
+                        style={{
+                          left: barInfo.x,
+                          width: barInfo.width,
+                          top: row.isMain ? 8 : 12,
+                          height: row.isMain ? 22 : 16,
+                        }}
+                        title={`${row.id} — ${row.descricao}\n${fmtDate(barInfo.start)} → ${fmtDate(barInfo.end)}\nStatus: ${s}`}
+                      >
+                        {sit?.kind === 'atrasada' && s !== 'Concluído' && s !== 'Cancelado' && (() => {
+                          const endX = barInfo.x + barInfo.width;
+                          const delayStart = Math.max(barInfo.x, todayX);
+                          const delayWidth = endX - delayStart;
+                          if (delayWidth <= 0) return null;
+                          return (
+                            <div
+                              className="absolute top-0 bottom-0 rounded-r-md bg-red-600"
+                              style={{ left: delayStart - barInfo.x, width: delayWidth }}
+                            />
+                          );
+                        })()}
+                        <span className="absolute inset-0 flex items-center px-1.5 overflow-hidden">
+                          <span className="text-white text-[10px] font-semibold truncate drop-shadow">{row.id}</span>
+                        </span>
+                      </div>
                     )}
                   </div>
                 );
@@ -1602,9 +1886,8 @@ function GanttView({ items }) {
             </div>
           </div>
         </div>
-      </div>
+      )}
 
-      {/* Legenda */}
       <div className="px-5 py-3 border-t border-stone-200/80 bg-gradient-to-r from-stone-50/80 to-white/80 flex items-center gap-4 flex-wrap">
         {[
           { color: 'bg-emerald-500', label: 'Concluído' },
@@ -1632,6 +1915,14 @@ function GanttView({ items }) {
 // ============================================================================
 function ConfirmDialog({ item, items, onCancel, onConfirm }) {
   const subCount = items.filter(i => String(i.id).startsWith(item.id + '.')).length;
+
+  // Confirma com Enter
+  useEffect(() => {
+    const h = (e) => { if (e.key === 'Enter') onConfirm(); };
+    document.addEventListener('keydown', h);
+    return () => document.removeEventListener('keydown', h);
+  }, [onConfirm]);
+
   return (
     <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-md z-50 flex items-center justify-center px-4" onClick={onCancel}>
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6" onClick={e => e.stopPropagation()} style={{ animation: 'fadeInUp 0.2s ease-out' }}>
@@ -1641,13 +1932,13 @@ function ConfirmDialog({ item, items, onCancel, onConfirm }) {
           </div>
           <div>
             <h3 className="font-serif-display text-xl text-slate-900">Confirmar exclusão</h3>
-            <p className="text-sm text-stone-600 mt-1">Excluir <strong className="text-slate-900">{item.id}</strong> — {item.descricao.slice(0, 80)}{item.descricao.length > 80 ? '…' : ''}?</p>
+            <p className="text-sm text-stone-600 mt-1">Excluir <strong className="text-slate-900">{item.id}</strong> — {(item.descricao || '').slice(0, 80)}{(item.descricao || '').length > 80 ? '…' : ''}?</p>
             {subCount > 0 && <p className="text-sm text-red-700 mt-2 bg-red-50 border border-red-200 rounded-lg p-2.5 font-medium">⚠️ <strong>{subCount} subtarefa{subCount > 1 ? 's' : ''}</strong> também será{subCount > 1 ? 'ão' : ''} excluída{subCount > 1 ? 's' : ''}.</p>}
           </div>
         </div>
         <div className="flex justify-end gap-2">
           <button onClick={onCancel} className="px-4 py-2 text-sm font-medium text-stone-700 hover:bg-stone-100 rounded-lg">Cancelar</button>
-          <button onClick={onConfirm} className="px-4 py-2 text-sm font-semibold bg-gradient-to-br from-red-600 to-red-700 hover:from-red-700 text-white rounded-lg shadow-md">Excluir</button>
+          <button onClick={onConfirm} autoFocus className="px-4 py-2 text-sm font-semibold bg-gradient-to-br from-red-600 to-red-700 hover:from-red-700 text-white rounded-lg shadow-md">Excluir</button>
         </div>
       </div>
     </div>
@@ -1656,7 +1947,12 @@ function ConfirmDialog({ item, items, onCancel, onConfirm }) {
 
 function Toast({ msg, type }) {
   return (
-    <div className={`fixed bottom-6 right-6 px-4 py-3 rounded-xl shadow-2xl text-sm font-semibold z-50 flex items-center gap-2 ${type === 'error' ? 'bg-gradient-to-br from-red-600 to-red-700 text-white' : 'bg-gradient-to-br from-slate-900 to-slate-800 text-white'}`} style={{ animation: 'fadeInUp 0.3s ease-out' }}>
+    <div
+      role="status"
+      aria-live="polite"
+      className={`fixed bottom-6 right-6 px-4 py-3 rounded-xl shadow-2xl text-sm font-semibold z-50 flex items-center gap-2 ${type === 'error' ? 'bg-gradient-to-br from-red-600 to-red-700 text-white' : 'bg-gradient-to-br from-slate-900 to-slate-800 text-white'}`}
+      style={{ animation: 'fadeInUp 0.3s ease-out' }}
+    >
       {type === 'error' ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
       {msg}
     </div>
