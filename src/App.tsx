@@ -188,8 +188,13 @@ const sortWithHierarchy = (items, sortKey, sortDir) => {
     } else if (sortKey === 'solicitante') {
       cmp = (a.solicitante || 'zzz').localeCompare(b.solicitante || 'zzz', 'pt-BR');
     } else if (sortKey === 'diasRestantes') {
-      const da = daysUntil(a.dataPrazo); const db = daysUntil(b.dataPrazo);
-      cmp = (da === null ? 9999 : da) - (db === null ? 9999 : db);
+      const da = daysUntil(a.dataPrazo);
+      const db = daysUntil(b.dataPrazo);
+      // Sem data sempre no final, independente da direção
+      if (da === null && db === null) return 0;
+      if (da === null) return 1;
+      if (db === null) return -1;
+      cmp = da - db;
     }
     return sortDir === 'asc' ? cmp : -cmp;
   };
@@ -449,7 +454,7 @@ export default function App() {
       setSortDir(d => d === 'asc' ? 'desc' : 'asc');
     } else {
       setSortKey(key);
-      setSortDir(key === 'id' ? 'desc' : 'asc');
+      setSortDir(key === 'id' ? 'desc' : key === 'diasRestantes' ? 'asc' : 'asc');
     }
   };
 
@@ -502,7 +507,7 @@ export default function App() {
           display: inline-block;
         }
         /* Largura fixa para todos os chips de status */
-        .status-chip-fixed { min-width: 108px; display: inline-flex; justify-content: center; }
+        .status-chip-fixed { min-width: 116px; display: inline-flex; justify-content: center; white-space: nowrap; }
         /* Dropdown de filtro acima da tabela */
         .filter-dropdown { position: absolute; top: calc(100% + 8px); left: 0; z-index: 200; }
       `}</style>
@@ -1076,7 +1081,7 @@ function StatusDropdown({ value, onChange, openUpward }) {
     <div className="relative">
       <button
         onClick={(e) => { e.stopPropagation(); setOpen(o => !o); }}
-        className={`status-chip-fixed inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold ring-1 ${style.chip} hover:shadow-md transition-all`}
+        className={`status-chip-fixed inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold ring-1 whitespace-nowrap ${style.chip} hover:shadow-md transition-all`}
       >
         <Icon className="w-3 h-3 flex-shrink-0" strokeWidth={2.5} />
         <span className="flex-1 text-center">{style.short}</span>
