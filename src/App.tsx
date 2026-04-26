@@ -508,8 +508,7 @@ export default function App() {
         }
         /* Largura fixa para todos os chips de status */
         .status-chip-fixed { min-width: 116px; display: inline-flex; justify-content: center; white-space: nowrap; }
-        /* Dropdown de filtro acima da tabela */
-        .filter-dropdown { position: absolute; top: calc(100% + 8px); left: 0; z-index: 200; }
+        /* Dropdown de filtro acima da tabela — posicionado via JS com position:fixed */
       `}</style>
 
       <Header
@@ -715,10 +714,26 @@ function Toolbar({ search, setSearch, filterStatus, setFilterStatus, filterPrior
 
 function MultiSelectFilter({ icon: Icon, label, values, setValues, options }) {
   const [open, setOpen] = useState(false);
-  const ref = useRef(null);
+  const [dropdownPos, setDropdownPos] = useState({ top: 0, left: 0 });
+  const btnRef = useRef(null);
+  const dropRef = useRef(null);
+
+  // Calcula posição do dropdown baseado no botão (position: fixed sai do stacking context da tabela)
+  const handleOpen = () => {
+    if (!open && btnRef.current) {
+      const rect = btnRef.current.getBoundingClientRect();
+      setDropdownPos({ top: rect.bottom + 6, left: rect.left });
+    }
+    setOpen(o => !o);
+  };
 
   useEffect(() => {
-    const h = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    const h = (e) => {
+      if (
+        btnRef.current && !btnRef.current.contains(e.target) &&
+        dropRef.current && !dropRef.current.contains(e.target)
+      ) setOpen(false);
+    };
     if (open) document.addEventListener('mousedown', h);
     return () => document.removeEventListener('mousedown', h);
   }, [open]);
@@ -734,9 +749,10 @@ function MultiSelectFilter({ icon: Icon, label, values, setValues, options }) {
   const count = values.size;
 
   return (
-    <div ref={ref} className="relative" style={{ zIndex: open ? 200 : 'auto' }}>
+    <div className="relative">
       <button
-        onClick={() => setOpen(o => !o)}
+        ref={btnRef}
+        onClick={handleOpen}
         className={`text-sm border rounded-xl px-3 py-2.5 bg-white/80 hover:bg-white flex items-center gap-2 transition-all font-medium ${count > 0 ? 'border-slate-900 text-slate-900' : 'border-stone-200 text-stone-600'}`}
       >
         <Icon className="w-3.5 h-3.5" />
@@ -745,8 +761,11 @@ function MultiSelectFilter({ icon: Icon, label, values, setValues, options }) {
         <ChevronDown className={`w-3.5 h-3.5 chevron-smooth ${open ? 'rotate-180' : ''}`} />
       </button>
       {open && (
-        // FIX v2: dropdown com z-index alto o suficiente para ficar acima da tabela
-        <div className="filter-dropdown bg-white border border-stone-200 rounded-xl shadow-2xl min-w-[200px] overflow-hidden" style={{ zIndex: 9999 }}>
+        <div
+          ref={dropRef}
+          style={{ position: 'fixed', top: dropdownPos.top, left: dropdownPos.left, zIndex: 99999 }}
+          className="bg-white border border-stone-200 rounded-xl shadow-2xl min-w-[200px] overflow-hidden"
+        >
           <div className="p-1.5">
             {options.map(opt => {
               const active = values.has(opt.value);
